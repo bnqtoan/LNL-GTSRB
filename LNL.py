@@ -10,24 +10,22 @@ notebook trains ~25 epochs (SGD + cosine LR); this file is tuned for that:
   IN forward():
     1. Input normalisation (ImageNet mean/std). The dataloader feeds raw [0,1];
        normalising in-model speeds convergence and matches the raw [0,1] Test input.
-    2. In-model train-time augmentation, MILD (small affine: +-10deg rotation,
-       +-5% translate, +-7% scale; no erasing, no flip — signs are direction-
-       sensitive). ON by default; AUTO-OFF at eval via self.training. Light enough
-       not to slow convergence, enough to curb overfitting over ~25 epochs.
+    2. In-model train-time augmentation, MODERATE (affine +-15deg/+-8%/+-12%, light
+       brightness+contrast +-20%, mild random-erasing p=0.2; no flip — signs are
+       direction-sensitive). ON by default; AUTO-OFF at eval via self.training.
+       Strength chosen to CLOSE the generalisation gap: with 25 epochs the model
+       otherwise memorises the train set (train-loss ~0) and test plateaus ~98.6%.
   IN the architecture:
     3. LayerScale on every residual branch (CaiT), initialised at 1.0 (identity)
-       so branches are fully active from step 1 (a small init like 1e-4 leaves them
-       near-dead and slow to wake up).
+       so branches are fully active from step 1.
     4. qkv_bias = True (free expressivity).
-    5. Stochastic depth / dropout = 0 (the model is not over-parameterised for this
-       dataset; convergence speed matters more than heavy regularisation).
+    5. Mild stochastic depth (drop_path 0.05) — regularises the 25-epoch run.
     6. Classifier feature = CLS token + mean-pooled patch tokens (summed, still
-       embed_dim) so head=Linear(192,43) stays plug-and-play; the mean-pool gives a
-       strong feature early, helping convergence.
+       embed_dim) so head=Linear(192,43) stays plug-and-play.
 
-NOTE on epochs: at the ORIGINAL 5-epoch SGD this lands ~97.7% (the model underfits
-in ~13k steps). The accuracy comes from training longer (~25 epochs) + cosine LR,
-which is why the shipped notebook sets that. With 5 epochs, expect ~97.7%.
+PROGRESS: 5-epoch SGD ~97.7% (underfit) -> 25 epochs + cosine LR ~98.6% (now
+overfitting: train-loss ~0) -> this version adds regularisation (label smoothing in
+the notebook + the moderate aug & drop_path here) to push toward >=99.5%.
 """
 import torch
 import torch.nn as nn
@@ -76,22 +74,37 @@ class LayerScale(nn.Module):
 
 
 def _batch_augment(x):
-    """GPU, batch-wise augmentation applied ONLY during training.
-    x: (B,3,H,W) in normalised space; per-sample affine transform, no grad needed.
-    MILD geometric jitter (tuned for a ~25-epoch run): small rotation/translation/
-    scale only. No random-erasing (too disruptive for fine traffic-sign detail) and
-    no horizontal flip (signs are direction-sensitive)."""
+    """GPU, batch-wise augmentation applied ONLY during training (per-sample, no grad).
+    Runs on RAW [0,1] input (before in-model normalisation). Tuned to CLOSE A
+    GENERALISATION GAP: with 25 epochs the model otherwise memorises the train set
+    (train-loss ~0, test ~98.6%). So we use MODERATE jitter — affine (rotation/
+    translation/scale), light brightness/contrast, and mild random-erasing — to force
+    generalisation. No horizontal flip (signs are direction-sensitive)."""
     B, C, H, W = x.shape
-    angles = (torch.rand(B, device=x.device) * 2 - 1) * (10 * math.pi / 180)   # +-10 deg
-    tx = (torch.rand(B, device=x.device) * 2 - 1) * 0.05                       # +-5%
-    ty = (torch.rand(B, device=x.device) * 2 - 1) * 0.05
-    scale = 1.0 + (torch.rand(B, device=x.device) * 2 - 1) * 0.07              # +-7%
+    # --- affine: rotation + translation + scale ---
+    angles = (torch.rand(B, device=x.device) * 2 - 1) * (15 * math.pi / 180)   # +-15 deg
+    tx = (torch.rand(B, device=x.device) * 2 - 1) * 0.08                       # +-8%
+    ty = (torch.rand(B, device=x.device) * 2 - 1) * 0.08
+    scale = 1.0 + (torch.rand(B, device=x.device) * 2 - 1) * 0.12              # +-12%
     cos, sin = torch.cos(angles) / scale, torch.sin(angles) / scale
     theta = torch.zeros(B, 2, 3, device=x.device, dtype=x.dtype)
     theta[:, 0, 0] = cos;  theta[:, 0, 1] = -sin; theta[:, 0, 2] = tx
     theta[:, 1, 0] = sin;  theta[:, 1, 1] = cos;  theta[:, 1, 2] = ty
     grid = F.affine_grid(theta, x.size(), align_corners=False)
     x = F.grid_sample(x, grid, padding_mode='reflection', align_corners=False)
+    # --- light photometric jitter (per-sample brightness * contrast), in normalised space ---
+    bright = 1.0 + (torch.rand(B, 1, 1, 1, device=x.device) * 2 - 1) * 0.20    # +-20%
+    contrast = 1.0 + (torch.rand(B, 1, 1, 1, device=x.device) * 2 - 1) * 0.20  # +-20%
+    mean = x.mean(dim=(2, 3), keepdim=True)
+    x = (x - mean) * contrast + mean * bright
+    # --- mild random-erasing (cutout) on a random subset ---
+    mask = torch.rand(B, device=x.device) < 0.20
+    if mask.any():
+        eh, ew = int(H * 0.18), int(W * 0.18)
+        for i in torch.nonzero(mask, as_tuple=False).flatten().tolist():
+            top = int(torch.randint(0, H - eh + 1, (1,)).item())
+            left = int(torch.randint(0, W - ew + 1, (1,)).item())
+            x[i, :, top:top + eh, left:left + ew] = 0.0
     return x
 
 
@@ -208,7 +221,7 @@ class LocalViT_TNT(TNT):
 
 @register_model
 def LNL_Ti(pretrained=False, **kwargs):
-    kwargs.setdefault('drop_path_rate', 0.0)   # 5-epoch SGD underfits -> no stochastic-depth regularisation
+    kwargs.setdefault('drop_path_rate', 0.05)  # mild stochastic depth: helps generalise over 25 epochs
     model = LocalViT_TNT(patch_size=16, embed_dim=192, in_dim=12, depth=12, num_heads=3, in_num_head=3,
                          qkv_bias=True, **kwargs)
     model.default_cfg = default_cfgs['tnt_t_conv_patch16_224']
@@ -219,7 +232,7 @@ def LNL_Ti(pretrained=False, **kwargs):
 
 @register_model
 def LNL_S(pretrained=False, **kwargs):
-    kwargs.setdefault('drop_path_rate', 0.0)   # 5-epoch SGD underfits -> no stochastic-depth regularisation
+    kwargs.setdefault('drop_path_rate', 0.05)  # mild stochastic depth: helps generalise over 25 epochs
     model = LocalViT_TNT(patch_size=16, embed_dim=384, in_dim=24, depth=12, num_heads=6, in_num_head=4,
                          qkv_bias=True, **kwargs)
     model.default_cfg = default_cfgs['tnt_s_conv_patch16_224']
