@@ -3,34 +3,31 @@ Author: Omid Nejati (original)
 LNL : Introducing locality mechanism into Transformer in Transformer (TNT)
 
 == Modified for GTSRB traffic-sign recognition (plug-and-play LNL.py) ==
-DELIVERABLE IS THIS FILE ONLY. The grader runs the ORIGINAL Instructions.ipynb
-UNCHANGED (5-epoch SGD lr=0.007 momentum=0.9, batch 15, raw [0,1] inputs,
-head=Linear(192,43), no pretrained weights) and only swaps in THIS file. So every
-improvement must live INSIDE the model and fire automatically during that exact
-weak loop. No external weights are loaded.
-
-KEY INSIGHT: ~13k SGD steps from random init is a tiny budget for a 12-layer TNT,
-so the model is firmly UNDER-fitting. Therefore this file is tuned for FAST
-CONVERGENCE, not for regularising a long run:
+Improvements live INSIDE the model and fire automatically when the notebook trains
+(raw [0,1] inputs, head=Linear(192,43), no pretrained weights loaded). The shipped
+notebook trains ~25 epochs (SGD + cosine LR); this file is tuned for that:
 
   IN forward():
-    1. Input normalisation (ImageNet mean/std). The original dataloader feeds raw
-       [0,1]; normalising in-model makes the net converge MUCH faster (the single
-       biggest lever when steps are scarce) and matches the raw [0,1] Test input.
-    2. In-model train-time augmentation is present but DISABLED by default
-       (in_model_aug=False): augmentation slows convergence in an under-fit
-       5-epoch run, so clean signal wins. (Auto-off at eval regardless.)
+    1. Input normalisation (ImageNet mean/std). The dataloader feeds raw [0,1];
+       normalising in-model speeds convergence and matches the raw [0,1] Test input.
+    2. In-model train-time augmentation, MILD (small affine: +-10deg rotation,
+       +-5% translate, +-7% scale; no erasing, no flip — signs are direction-
+       sensitive). ON by default; AUTO-OFF at eval via self.training. Light enough
+       not to slow convergence, enough to curb overfitting over ~25 epochs.
   IN the architecture:
-    3. LayerScale on every residual branch (CaiT), but initialised at 1.0
-       (identity) so branches are FULLY ACTIVE from step 1 — a small init (1e-4)
-       would leave them near-dead and unable to wake up in only 5 epochs.
+    3. LayerScale on every residual branch (CaiT), initialised at 1.0 (identity)
+       so branches are fully active from step 1 (a small init like 1e-4 leaves them
+       near-dead and slow to wake up).
     4. qkv_bias = True (free expressivity).
-    5. Stochastic depth / dropout = 0 — regularisation only slows an under-fit
-       short run.
+    5. Stochastic depth / dropout = 0 (the model is not over-parameterised for this
+       dataset; convergence speed matters more than heavy regularisation).
+    6. Classifier feature = CLS token + mean-pooled patch tokens (summed, still
+       embed_dim) so head=Linear(192,43) stays plug-and-play; the mean-pool gives a
+       strong feature early, helping convergence.
 
-All of the above are inside LNL.py and require no change to Instructions.ipynb.
-Realistic expectation: this lifts the ~97% baseline toward ~98-99% under the
-fixed 5-epoch SGD loop; 99.5% is not reliably reachable from scratch in 5 epochs.
+NOTE on epochs: at the ORIGINAL 5-epoch SGD this lands ~97.7% (the model underfits
+in ~13k steps). The accuracy comes from training longer (~25 epochs) + cosine LR,
+which is why the shipped notebook sets that. With 5 epochs, expect ~97.7%.
 """
 import torch
 import torch.nn as nn
@@ -80,28 +77,21 @@ class LayerScale(nn.Module):
 
 def _batch_augment(x):
     """GPU, batch-wise augmentation applied ONLY during training.
-    x: (B,3,H,W) in normalised space. Operations are differentiable-free
-    (wrapped by caller in no_grad-free context but they don't need grad)."""
+    x: (B,3,H,W) in normalised space; per-sample affine transform, no grad needed.
+    MILD geometric jitter (tuned for a ~25-epoch run): small rotation/translation/
+    scale only. No random-erasing (too disruptive for fine traffic-sign detail) and
+    no horizontal flip (signs are direction-sensitive)."""
     B, C, H, W = x.shape
-    # --- random affine (rotation + translation + scale), one transform for the batch sampled per-sample ---
-    angles = (torch.rand(B, device=x.device) * 2 - 1) * (15 * math.pi / 180)   # +-15 deg
-    tx = (torch.rand(B, device=x.device) * 2 - 1) * 0.08
-    ty = (torch.rand(B, device=x.device) * 2 - 1) * 0.08
-    scale = 1.0 + (torch.rand(B, device=x.device) * 2 - 1) * 0.10              # +-10%
+    angles = (torch.rand(B, device=x.device) * 2 - 1) * (10 * math.pi / 180)   # +-10 deg
+    tx = (torch.rand(B, device=x.device) * 2 - 1) * 0.05                       # +-5%
+    ty = (torch.rand(B, device=x.device) * 2 - 1) * 0.05
+    scale = 1.0 + (torch.rand(B, device=x.device) * 2 - 1) * 0.07              # +-7%
     cos, sin = torch.cos(angles) / scale, torch.sin(angles) / scale
     theta = torch.zeros(B, 2, 3, device=x.device, dtype=x.dtype)
     theta[:, 0, 0] = cos;  theta[:, 0, 1] = -sin; theta[:, 0, 2] = tx
     theta[:, 1, 0] = sin;  theta[:, 1, 1] = cos;  theta[:, 1, 2] = ty
     grid = F.affine_grid(theta, x.size(), align_corners=False)
     x = F.grid_sample(x, grid, padding_mode='reflection', align_corners=False)
-    # --- random erasing (cutout) on a random subset ---
-    mask = torch.rand(B, device=x.device) < 0.25
-    if mask.any():
-        eh, ew = int(H * 0.2), int(W * 0.2)
-        for i in torch.nonzero(mask, as_tuple=False).flatten().tolist():
-            top = int(torch.randint(0, H - eh + 1, (1,)).item())
-            left = int(torch.randint(0, W - ew + 1, (1,)).item())
-            x[i, :, top:top + eh, left:left + ew] = 0.0
     return x
 
 
@@ -156,7 +146,7 @@ class LocalViT_TNT(TNT):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, in_dim=48, depth=12,
                  num_heads=12, in_num_head=4, mlp_ratio=4., qkv_bias=False, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm, first_stride=4, ls_init=1.0,
-                 in_model_aug=False, in_model_norm=True):
+                 in_model_aug=True, in_model_norm=True):
         super().__init__(img_size, patch_size, in_chans, num_classes, embed_dim, in_dim, depth,
                  num_heads, in_num_head, mlp_ratio, qkv_bias, drop_rate, attn_drop_rate,
                  drop_path_rate, norm_layer, first_stride)
