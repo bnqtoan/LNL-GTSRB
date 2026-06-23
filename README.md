@@ -4,36 +4,50 @@
 
 Bài giữa kỳ: cải tiến mô hình nhận dạng biển báo giao thông **GTSRB** dựa trên
 **LNL (Locality-iN-Locality)** — Transformer-in-Transformer + cơ chế locality.
+Mục tiêu chấm điểm: **Top-1 ≥ 99.5%**.
 
 > **Academic fork.** Mã gốc thuộc về **Omid Nejati Manzari** (xem Citation cuối trang).
 > Repo này chỉ dùng cho mục đích học tập; phần cải tiến nằm trong `LNL.py`.
 
-## Cách chạy (plug-and-play)
+## Kiểm chứng độ chính xác — KHÔNG cần train lại (plug-and-play)
 
-Bấm nút **Open In Colab** ở trên → Runtime → GPU (T4) → Run all.
-Notebook tự `git clone` repo này (đã chứa `LNL.py` cải tiến) rồi chạy nguyên luồng gốc.
+Bấm **Open In Colab** ở trên (mở `Instructions_NhomX.ipynb`) → Runtime → **GPU (T4)** → **Run all**.
+
+Notebook tự động:
+1. `git clone` repo này (đã chứa `LNL.py` cải tiến);
+2. tải trọng số đã train sẵn **`lnl_gtsrb.pth`** từ [GitHub Release](../../releases/latest);
+3. dựng model **y hệt** `Instructions.ipynb` gốc: `LNL_Ti` → `head = Linear(192, 43)` → `.cuda()`;
+4. nạp trọng số rồi chạy **đúng cell Test gốc** (ảnh thô `[0,1]`) → in **`Standard accuracy`**.
+
+Số `Standard accuracy` ở mục 6 là kết quả Top-1.
+
+> **Vì sao plug-and-play đúng:** cell Test gốc đưa vào ảnh thô `[0,1]` (chỉ `Resize+ToTensor`).
+> Chuẩn hoá ImageNet được nhúng **bên trong** `LNL.py` (`forward_features`), và trọng số cũng được
+> train trên đúng đường ống đó → train-time và verify-time dùng chung code path, không lệch tiền xử lý.
 
 ## Cải tiến (đều nằm trong `LNL.py`)
 
-Mọi thay đổi nằm bên trong file model, tự kích hoạt khi chạy notebook:
-
-1. **Chuẩn hoá đầu vào trong model** (ImageNet mean/std) — dataloader gốc không normalize; đưa vào `forward` giúp hội tụ tốt hơn và để pretrained weights plug-and-play với cell Test gốc (ảnh thô [0,1]).
+1. **Chuẩn hoá đầu vào trong model** (ImageNet mean/std) — để khớp cell Test gốc (ảnh thô `[0,1]`) và hội tụ tốt hơn.
 2. **Augmentation trong model** (affine + random erasing), chỉ bật khi `self.training` (tự tắt lúc test). Không lật ngang vì biển báo nhạy hướng.
 3. **LayerScale** trên mỗi nhánh residual (ổn định Transformer sâu — CaiT).
 4. **qkv_bias = True**.
 5. **Stochastic depth** (drop_path = 0.1).
 
-## Deliverables (giữa kỳ)
+## Deliverables
 
 | File | Mô tả |
 |------|-------|
-| `LNL.py` | Model đã cải tiến (plug-and-play với Instructions.ipynb gốc) |
-| `Instructions_NhomX.ipynb` | Notebook có thêm bước **lưu** (`torch.save`) và **nạp** (`load_state_dict`) trọng số |
-| `lnl_gtsrb.pth` | Pretrained model để kiểm chứng (tạo ra khi chạy cell "Lưu mô hình") |
+| `LNL.py` | Model đã cải tiến (plug-and-play với `Instructions.ipynb` gốc) |
+| `lnl_gtsrb.pth` | **Trọng số đã train sẵn** để kiểm chứng — tải ở **[Releases](../../releases/latest)** |
+| `Instructions_NhomX.ipynb` | Notebook kiểm chứng: clone → tải `.pth` → nạp → chạy cell Test gốc |
+| `LNL_train_colab.ipynb` | (Công cụ của nhóm) notebook train tạo ra `lnl_gtsrb.pth` — thầy không cần chạy |
+| `dien_giai_mo_hinh.md` | Diễn giải ngắn gọn mô hình & cách kiểm chứng |
 
-## Kiểm chứng không cần train lại
+## Train lại (tuỳ chọn — tạo lại trọng số)
 
-Build model (cell 20–23) → chạy cell **"Nạp pretrained"** (`model.load_state_dict('lnl_gtsrb.pth')`) → chạy cell **Test**.
+Mở `LNL_train_colab.ipynb` trên Colab (T4) → Run all. Notebook dùng AdamW + cosine+warmup + label
+smoothing + EMA (~30 epoch), DataLoader ảnh thô `[0,1]` (normalize/aug do `LNL.py` lo), checkpoint +
+auto-resume lên Google Drive, và tự kiểm chứng plug-and-play cuối notebook.
 
 ---
 
