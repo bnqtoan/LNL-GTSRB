@@ -47,7 +47,9 @@ Số `Standard accuracy` ở mục 6 là kết quả Top-1.
 
 Mở `LNL_train_colab.ipynb` trên Colab (T4) → Run all. Notebook dùng AdamW + cosine+warmup + label
 smoothing + EMA (~30 epoch), DataLoader ảnh thô `[0,1]` (normalize/aug do `LNL.py` lo), checkpoint +
-auto-resume lên Google Drive, và tự kiểm chứng plug-and-play cuối notebook.
+auto-resume lên Google Drive, tự kiểm chứng plug-and-play, rồi **tự upload `lnl_gtsrb.pth` lên GitHub
+Release `weights-v1` ngay từ Colab** (hỏi token qua `getpass`, chỉ upload khi đạt ≥ 99.5%). Toàn bộ vòng
+lặp chạy trên Colab, không cần thao tác local.
 
 ---
 
